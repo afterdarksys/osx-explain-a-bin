@@ -12,66 +12,97 @@ import (
 var (
 	outputJSON bool
 	verbose    bool
+	failOver   int
 )
+
+// version is set by SetVersion from the value stamped into the binary at build
+// time, so `--version` and the Makefile cannot drift apart.
+var version = "dev"
+
+// SetVersion records the build version. Call it before Execute.
+func SetVersion(v string) {
+	if v != "" {
+		version = v
+		rootCmd.Version = v
+	}
+}
 
 var rootCmd = &cobra.Command{
 	Use:   "explain-bin [binary-path]",
 	Short: "Explain what a macOS binary does",
 	Long: `explain-bin - Dev-First Binary Trust Report
 
-Analyzes a macOS binary and provides a human-readable trust report:
+Analyzes a macOS binary and produces a human-readable trust report:
 
-  • Who signed it (code signing authority, team ID)
-  • Entitlements (what permissions it requests)
-  • Network behavior (embedded URLs, IPs, domains)
-  • Persistence attempts (LaunchAgents, Login Items)
-  • Known malware patterns (heuristic, not signature)
+  • Who signed it, and whether that signature establishes an identity
+  • Whether Gatekeeper would accept it, and whether it is notarized
+  • Entitlements it declares, and which of them weaken the runtime
+  • Network indicators embedded in the binary (URLs, IPs, domains)
+  • Persistence: launchd jobs on this machine that run it, and any it ships
 
-Think of it as a local, privacy-preserving alternative to VirusTotal.
+Every point of the risk score is attributed to a named signal, shown under
+RISK BREAKDOWN, so the verdict can be checked rather than trusted.
+
+Analysis is entirely local; nothing is uploaded anywhere.
 
 Examples:
   explain-bin ./mystery_binary
   explain-bin /Applications/Slack.app
-  explain-bin /usr/local/bin/node --verbose`,
-	Args:    cobra.ExactArgs(1),
-	Version: "1.0.0",
-	RunE:    runExplain,
+  explain-bin --verbose /usr/local/bin/node
+  explain-bin --json ./tool | jq .risk_signals
+  explain-bin --fail-over 40 ./tool    # exit 2 if the score is 40 or higher`,
+	Args:         cobra.ExactArgs(1),
+	RunE:         runExplain,
+	SilenceUsage: true,
 }
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
 func init() {
-	rootCmd.Flags().BoolVar(&outputJSON, "json", false, "output in JSON format")
-	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show detailed output")
+	rootCmd.Version = version
+
+	// These are persistent so subcommands inherit them. Registered on Flags()
+	// they were local to the root command, which made `explain-bin hash
+	// --json` fail with "unknown flag" and left the JSON branch of the hash
+	// command unreachable.
+	rootCmd.PersistentFlags().BoolVar(&outputJSON, "json", false, "output in JSON format")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "show detailed output")
+
+	rootCmd.Flags().IntVar(&failOver, "fail-over", -1,
+		"exit with status 2 if the risk score is at or above this value (for CI use)")
 }
 
 func runExplain(cmd *cobra.Command, args []string) error {
 	path := args[0]
 
-	// Check if file exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return fmt.Errorf("file not found: %s", path)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file not found: %s", path)
+		}
+		return fmt.Errorf("cannot access %s: %w", path, err)
 	}
 
-	// Create analyzer
-	a := analyzer.NewAnalyzer(verbose)
-
-	// Run analysis
-	analysisReport, err := a.Analyze(path)
+	analysisReport, err := analyzer.NewAnalyzer(verbose).Analyze(path)
 	if err != nil {
 		return fmt.Errorf("analysis failed: %w", err)
 	}
 
-	// Output
 	if outputJSON {
-		return report.PrintJSON(analysisReport)
+		if err := report.PrintJSON(analysisReport); err != nil {
+			return err
+		}
+	} else {
+		report.PrintReport(analysisReport, verbose)
 	}
 
-	report.PrintReport(analysisReport, verbose)
+	// A distinct exit status lets this gate a build without parsing output.
+	if failOver >= 0 && analysisReport.RiskScore >= failOver {
+		os.Exit(2)
+	}
 	return nil
 }

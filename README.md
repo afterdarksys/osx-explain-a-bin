@@ -2,14 +2,14 @@
 
 A dev-first CLI tool that explains what a macOS binary does in human-readable terms.
 
-**Think: Local, privacy-preserving alternative to VirusTotal.**
+**Think: local, privacy-preserving triage — every check runs on your machine, nothing is uploaded.**
 
 ## The Problem
 
 Developers constantly download random tools, but:
 - VirusTotal is cloud-based and privacy-hostile
 - `codesign -dvvv` output is cryptic
-- Entitlements are hidden in XML
+- Entitlements are buried in a plist blob
 - No easy way to assess trust
 
 ## Solution
@@ -23,53 +23,51 @@ $ explain-bin ./mystery_binary
 
 File: mystery_binary
 Path: /Users/dev/Downloads/mystery_binary
-Type: Mach-O 64-bit (arm64)
-Size: 1234567 bytes
+Type: Mach-O universal (x86_64, arm64)
+Size: 4.2 MB (4404019 bytes)
 SHA256: abc123...
+Quarantine: yes (downloaded via Safari)
 
-Risk Score: 🟡 45/100 (MEDIUM)
+Risk Score: 🟡 50/100 (MEDIUM)
 
-Summary: Signed by Acme Corp (ABC123), not notarized. 3 warning(s).
+Summary: Ad-hoc signed (no developer identity). Risk level: MEDIUM (50/100). 3 finding(s)
 
 ───────────────────────────────────────────────────────────────
 CODE SIGNING
 ───────────────────────────────────────────────────────────────
-  Status:        ✓ Signed
-  Signature:     ✓ Valid
-  Notarization:  ✗ Not Notarized
-  Authority:     Developer ID Application: Acme Corp (ABC123)
-  Team:          Acme Corp
-  Team ID:       ABC123
+  Status:            ⚠️  Ad-hoc signed (no developer identity)
+  Signature:         ✓ Valid
+  Notarization:      ✗ Not notarized
+  Gatekeeper:        ✗ Rejected (code failed to satisfy specified code requirement(s))
+  Hardened runtime:  ✗ No
+  Identifier:        mystery-5555494423a60eb55380388f803b7e234c2b459e
+  Signing flags:     adhoc
 
 ───────────────────────────────────────────────────────────────
-ENTITLEMENTS
+RISK BREAKDOWN
 ───────────────────────────────────────────────────────────────
-  Sandbox:           ✗ No
-  Hardened Runtime:  ✓ Yes
-  Camera Access:     ✗ No
-  Microphone Access: ✗ No
-  Full Disk Access:  ✗ No
-
-───────────────────────────────────────────────────────────────
-⚠️  WARNINGS
-───────────────────────────────────────────────────────────────
-  • Binary is not notarized by Apple
-  • Sandbox is disabled
-  • Found 2 hardcoded IPs
+  +35  Binary is ad-hoc signed: the signature identifies no developer and anyone can produce one
+  +10  Gatekeeper would reject this binary: code failed to satisfy specified code requirement(s)
+  +5   Hardened runtime is not enabled, so library injection protections are off
 
 ═══════════════════════════════════════════════════════════════
 ```
 
+Every point of the score is attributed to a named signal, so the verdict can be
+checked rather than taken on faith.
+
 ## Features
 
-- **Code signing analysis** - Authority, team ID, validity, notarization
-- **Entitlement extraction** - All permissions in plain English
-- **Network indicators** - URLs, IPs, domains embedded in binary
-- **Persistence detection** - LaunchAgents, Login Items, cron references
-- **Risk scoring** - 0-100 score with human-readable level
-- **App bundle support** - Analyzes .app bundles correctly
-- **JSON output** - For automation and integration
-- **Binary comparison** - Compare two binaries side by side
+- **Code signing analysis** — authority chain, team ID, validity, ad-hoc detection, signing flags
+- **Gatekeeper and notarization** — what macOS itself would do, and whether a notarization ticket is stapled
+- **Entitlement extraction** — full plist decoding, with each entitlement explained and graded
+- **Network indicators** — URLs, routable IPs, domains, ports and networking APIs found in the binary
+- **Persistence detection** — launchd jobs on this machine that actually run the binary, plus any it ships
+- **Explainable risk scoring** — 0–100, with a per-signal breakdown
+- **App bundle support** — resolves the real executable via `CFBundleExecutable`
+- **JSON output** — for automation and integration
+- **Binary comparison** — side by side, naming what differs
+- **CI gate** — `--fail-over N` exits 2 when the score is at or above N
 
 ## Installation
 
@@ -78,148 +76,147 @@ make build
 sudo make install
 ```
 
+Requires Go 1.21+ to build (developed against 1.24.6; see `.tool-versions`).
+
 ## Usage
 
 ### Basic Analysis
 
 ```bash
-# Analyze any binary
 explain-bin ./mystery_binary
-
-# Analyze an app bundle
 explain-bin /Applications/Slack.app
-
-# Analyze a system binary
 explain-bin /usr/bin/curl
 ```
 
 ### Verbose Output
 
 ```bash
-# Show all entitlements and URLs
-explain-bin ./binary --verbose
+# Show every entitlement, URL and domain
+explain-bin --verbose ./binary
 ```
 
 ### JSON Output
 
 ```bash
-# Machine-readable output
-explain-bin ./binary --json
-
-# Pipe to jq
-explain-bin ./binary --json | jq '.risk_score'
+explain-bin --json ./binary
+explain-bin --json ./binary | jq '.risk_score'
+explain-bin --json ./binary | jq '.risk_signals[] | select(.points > 0)'
 ```
 
 ### Compare Binaries
 
 ```bash
-# Side-by-side comparison
 explain-bin compare ./binary1 ./binary2
 ```
 
 ### Calculate Hashes
 
 ```bash
-# Get MD5, SHA1, SHA256
 explain-bin hash ./binary
+explain-bin hash --json ./binary
+```
 
-# JSON output
-explain-bin hash ./binary --json
+### CI Gate
+
+```bash
+# Exit status 2 if the binary scores 40 or higher
+explain-bin --fail-over 40 ./release/mytool
 ```
 
 ## Risk Scoring
 
-| Factor | Points | Description |
-|--------|--------|-------------|
-| Unsigned | +30 | Binary not code signed |
-| Invalid signature | +25 | Signature verification failed |
-| Not notarized | +10 | Not notarized by Apple |
-| Ad-hoc signature | +15 | Self-signed, no team ID |
-| Dangerous entitlement | +15 each | See list below |
-| Sandbox disabled | +20 | No sandbox protection |
-| Full disk access | +15 | Can read all files |
-| Suspicious URLs | +20 | Known bad patterns |
-| Hardcoded IPs | +10 | Direct IP connections |
-| LaunchAgent | +15 | Installs persistence |
-| LaunchDaemon | +20 | System-level persistence |
-| Login item | +10 | Runs at user login |
+The model is **combination-aware**: a capability that is unremarkable on signed,
+notarized software becomes meaningful on code whose origin cannot be
+established. Contributions are capped so that a legitimately permissive
+application (a browser, an Electron app) does not automatically land in HIGH.
+
+### Provenance
+
+| Signal | Points | Notes |
+|--------|--------|-------|
+| Signature invalid | +45 | Binary was modified after signing |
+| Unsigned | +35 | Origin cannot be established |
+| Ad-hoc signed | +35 | Names no developer; anyone can produce one |
+| Not notarized | +10 | Signed identity, but no Apple ticket |
+| Gatekeeper rejects | +10 | Only when Gatekeeper actually assessed it |
+| No hardened runtime | +5 | Injection protections off |
+
+Apple platform binaries (`Authority=Software Signing`) are recognised as
+first-party and are not penalised for the notarization ticket Apple never
+issues for macOS itself.
+
+### Capabilities
+
+| Signal | Points | Notes |
+|--------|--------|-------|
+| Runtime-weakening entitlements | +10, then +5 each (cap 25) | Diminishing returns |
+| `get-task-allow` | +15 | A debug entitlement in a shipped build |
+| Private no-sandbox | +15 | |
+| Full filesystem access | +10 | |
+| Library validation off **and** DYLD env vars | +10 | The pair that permits injection |
+
+### Network and persistence
+
+| Signal | Points | Notes |
+|--------|--------|-------|
+| Notable URLs | +10, then +2 each (cap 20) | Each finding carries its reason |
+| Hardcoded routable IPs | +5 | Private and reserved ranges ignored |
+| Only unencrypted HTTP | +3 | |
+| Installed as LaunchDaemon | +20 | Runs as root at boot |
+| Installed as LaunchAgent | +12 | Runs at login |
+| Ships a LaunchDaemon / LaunchAgent | +10 / +6 | Can install it |
+| Persistence referenced in strings | +2 each (cap 6) | Weak evidence, scored as such |
+| Untrusted origin **and** persistence or C2 indicators | +15 | Combination signal |
 
 ### Risk Levels
 
 | Score | Level | Meaning |
 |-------|-------|---------|
-| 0-19 | MINIMAL | Looks safe, well-signed |
-| 20-39 | LOW | Minor concerns |
-| 40-69 | MEDIUM | Review before running |
-| 70-100 | HIGH | Significant risk factors |
+| 0–19 | MINIMAL | Nothing notable |
+| 20–39 | LOW | Minor concerns |
+| 40–69 | MEDIUM | Review before running |
+| 70–100 | HIGH | Significant risk factors |
 
-## Dangerous Entitlements
+## Entitlements
 
-These entitlements warrant extra scrutiny:
+Entitlements are decoded from the real property list, so a key set to `<false/>`
+is reported as disabled and arrays keep every element. Each entitlement is
+graded:
 
-| Entitlement | Risk |
-|-------------|------|
-| `com.apple.security.cs.disable-library-validation` | Allows unsigned libraries |
-| `com.apple.security.cs.allow-unsigned-executable-memory` | Memory exploits |
-| `com.apple.security.cs.allow-jit` | JIT compilation |
-| `com.apple.security.cs.allow-dyld-environment-variables` | DYLD injection |
-| `com.apple.security.cs.debugger` | Debug other processes |
-| `com.apple.security.get-task-allow` | Task port access |
-| `com.apple.private.security.no-sandbox` | No sandbox |
-
-## Network Indicators
-
-The tool extracts and flags:
-
-- **URLs** - HTTP/HTTPS endpoints embedded in binary
-- **Suspicious URLs** - Pastebin, ngrok, URL shorteners, IPs
-- **Hardcoded IPs** - Direct IP connections (not localhost/RFC1918)
-- **Domains** - Domain names found in strings
+- **high** — relaxes a hardened runtime protection, escapes the sandbox, or
+  ships debug access. Every `com.apple.security.cs.*` entitlement is treated as
+  high, including ones added after this catalog was written.
+- **medium** — real capability worth knowing about: camera, microphone,
+  location, contacts, Apple Events, JIT.
+- **low** — ordinary declarations such as `app-sandbox`, `network.client` and
+  `keychain-access-groups`.
 
 ## Persistence Detection
 
-Checks for:
+Launchd jobs are matched on the **resolved program path** — `Program`,
+`ProgramArguments[0]`, or a path inside the bundle — never on the binary's file
+name. The report names the plist and which field matched.
 
-- **LaunchAgents** - User-level persistence
-- **LaunchDaemons** - System-level persistence
-- **Login Items** - LSSharedFileList API usage
-- **Cron jobs** - crontab references
-- **Kernel extensions** - kext references
+Checked locations: `~/Library/LaunchAgents`, `/Library/LaunchAgents`,
+`/Library/LaunchDaemons`, `/System/Library/LaunchAgents`,
+`/System/Library/LaunchDaemons`, and `Contents/Library/Launch*` inside a bundle.
 
-## Use Cases
-
-### Security Review
-"Is this download safe to run?"
-
-### Incident Response
-"What does this suspicious binary do?"
-
-### Compliance
-"Document the trust properties of our tools."
-
-### CI/CD
-"Verify binaries before distribution."
-
-## Comparison to Other Tools
-
-| Feature | explain-bin | codesign | VirusTotal |
-|---------|-------------|----------|------------|
-| Local only | ✓ | ✓ | ✗ |
-| Privacy | ✓ | ✓ | ✗ |
-| Human-readable | ✓ | ✗ | ✓ |
-| Risk scoring | ✓ | ✗ | ✓ |
-| Network analysis | ✓ | ✗ | ✓ |
-| Persistence detection | ✓ | ✗ | ✗ |
-| Free | ✓ | ✓ | Freemium |
+String references to persistence machinery (launchd APIs, Login Items, cron,
+kexts, XPC) are reported separately and weighted lightly, because referencing a
+mechanism is not the same as using it.
 
 ## Technical Details
 
 ### Analysis Methods
 
-1. **Code signing**: Uses `codesign -dvvv` and `spctl`
-2. **Entitlements**: Extracts from binary with `codesign`
-3. **Strings**: Custom extraction (6+ char printable sequences)
-4. **Mach-O parsing**: Basic magic byte detection
+1. **Code signing** — `codesign -dvvv`, `codesign --verify --strict` (`--deep`
+   for bundles), `spctl --assess`, `xcrun stapler validate`
+2. **Entitlements** — extracted with `codesign` and decoded with a real XML
+   plist parser; binary plists are converted via `plutil`
+3. **Mach-O** — parsed with `debug/macho`, so architecture comes from `cputype`
+   and universal binaries report every slice
+4. **Strings** — streamed in 1 MiB chunks with a memory budget, extracted once
+   and shared between the network and persistence analyzers
 
 ### Requirements
 
@@ -228,18 +225,50 @@ Checks for:
 
 ### Limitations
 
-- Heuristic-based, not signature-based malware detection
-- Cannot detect runtime-only behavior
-- Some obfuscated strings may be missed
+- Heuristic, not signature-based malware detection
+- Cannot observe runtime behaviour
+- Obfuscated or encrypted strings will be missed
+- Notarization of a bare command-line binary usually cannot be determined
+  offline: no ticket is stapled, and Gatekeeper resolves it over the network.
+  The report says "not determinable locally" rather than guessing.
+- String extraction stops at a 64 MiB budget; when it does, findings are
+  reported as a lower bound
+
+## Development
+
+```bash
+make check    # fmt + vet + test
+make test     # go test ./...
+make cover    # with coverage
+make smoke    # build and run against system binaries
+```
 
 ## Roadmap
 
 - [ ] YARA rule support
-- [ ] VirusTotal API integration (optional)
-- [ ] Mach-O header deep analysis
-- [ ] Objective-C class extraction
-- [ ] Swift metadata parsing
-- [ ] Import/export analysis
+- [ ] Optional VirusTotal hash lookup (off by default)
+- [ ] Objective-C class and Swift metadata extraction
+- [ ] Import/export and linked-library analysis
+- [ ] Certificate expiry and revocation checking
+
+## Use Cases
+
+- **Security review** — "is this download safe to run?"
+- **Incident response** — "what does this suspicious binary do?"
+- **Compliance** — document the trust properties of your tools
+- **CI/CD** — gate releases with `--fail-over`
+
+## Comparison to Other Tools
+
+| Feature | explain-bin | codesign | VirusTotal |
+|---------|-------------|----------|------------|
+| Local only | ✓ | ✓ | ✗ |
+| Privacy | ✓ | ✓ | ✗ |
+| Human-readable | ✓ | ✗ | ✓ |
+| Explainable risk score | ✓ | ✗ | ✗ |
+| Network analysis | ✓ | ✗ | ✓ |
+| Persistence detection | ✓ | ✗ | ✗ |
+| Free | ✓ | ✓ | Freemium |
 
 ## License
 
@@ -247,9 +276,9 @@ MIT License
 
 ## Related Projects
 
-- **osx-syscall-firewall** - Per-binary system call policies
-- **osx-permission-abuse-monitor** - Post-grant permission monitoring
-- **ads-process-monitor** - Process visibility and threat detection
+- **osx-syscall-firewall** — per-binary system call policies
+- **osx-permission-abuse-monitor** — post-grant permission monitoring
+- **ads-process-monitor** — process visibility and threat detection
 
 ---
 

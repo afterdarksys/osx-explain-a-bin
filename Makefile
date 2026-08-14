@@ -1,8 +1,12 @@
-.PHONY: build clean install test deps
+.PHONY: build clean install test deps vet fmt check
 
 BINARY=explain-bin
-VERSION=1.0.0
+VERSION=2.0.0
 BUILD_DIR=build
+
+# main.Version is a real symbol in main.go. It previously was not, so this
+# -X flag was silently discarded and --version reported a hardcoded constant.
+LDFLAGS=-s -w -X main.Version=$(VERSION)
 
 all: deps build
 
@@ -11,12 +15,12 @@ deps:
 
 build:
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) .
+	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) .
 
 build-all: deps
 	@mkdir -p $(BUILD_DIR)
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64 .
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64 .
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64 .
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64 .
 
 install: build
 	cp $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
@@ -31,10 +35,26 @@ clean:
 	go clean
 
 test:
+	go test ./...
+
+test-verbose:
 	go test -v ./...
 
-# Quick test on common binaries
-test-run: build
+cover:
+	go test -cover ./...
+
+vet:
+	go vet ./...
+
+fmt:
+	go fmt ./...
+
+# Everything CI should gate on.
+check: fmt vet test
+
+# Smoke test against binaries with known-good properties: a signed Apple
+# platform binary and a notarized third-party app.
+smoke: build
 	./$(BUILD_DIR)/$(BINARY) /bin/ls
 	@echo ""
 	./$(BUILD_DIR)/$(BINARY) /usr/bin/curl
@@ -42,11 +62,16 @@ test-run: build
 .PHONY: help
 help:
 	@echo "Available targets:"
-	@echo "  build      - Build the binary"
-	@echo "  build-all  - Build for all platforms"
-	@echo "  install    - Install to /usr/local/bin"
-	@echo "  uninstall  - Remove from /usr/local/bin"
-	@echo "  clean      - Clean build artifacts"
-	@echo "  test       - Run tests"
-	@echo "  test-run   - Build and test on system binaries"
-	@echo "  deps       - Download dependencies"
+	@echo "  build        - Build the binary"
+	@echo "  build-all    - Build for arm64 and amd64"
+	@echo "  install      - Install to /usr/local/bin"
+	@echo "  uninstall    - Remove from /usr/local/bin"
+	@echo "  clean        - Clean build artifacts"
+	@echo "  test         - Run tests"
+	@echo "  test-verbose - Run tests with -v"
+	@echo "  cover        - Run tests with coverage"
+	@echo "  vet          - Run go vet"
+	@echo "  fmt          - Run go fmt"
+	@echo "  check        - fmt + vet + test"
+	@echo "  smoke        - Build and run against system binaries"
+	@echo "  deps         - Tidy dependencies"

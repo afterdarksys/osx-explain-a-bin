@@ -1,8 +1,10 @@
 package explainbin
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/afterdarksys/osx-explain-a-bin/internal/analyzer"
@@ -22,19 +24,29 @@ func init() {
 }
 
 func runCompare(cmd *cobra.Command, args []string) error {
-	path1 := args[0]
-	path2 := args[1]
-
 	a := analyzer.NewAnalyzer(false)
 
-	report1, err := a.Analyze(path1)
-	if err != nil {
-		return fmt.Errorf("failed to analyze %s: %w", path1, err)
+	reports := make([]*analyzer.AnalysisReport, 2)
+	for i, path := range args[:2] {
+		r, err := a.Analyze(path)
+		if err != nil {
+			return fmt.Errorf("failed to analyze %s: %w", path, err)
+		}
+		reports[i] = r
 	}
+	left, right := reports[0], reports[1]
 
-	report2, err := a.Analyze(path2)
-	if err != nil {
-		return fmt.Errorf("failed to analyze %s: %w", path2, err)
+	if outputJSON {
+		data, err := json.MarshalIndent(map[string]interface{}{
+			"left":      left,
+			"right":     right,
+			"identical": left.Binary.SHA256 == right.Binary.SHA256 && left.Binary.SHA256 != "",
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
 	}
 
 	fmt.Println()
@@ -44,42 +56,137 @@ func runCompare(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	row := func(label, l, r string) {
+		marker := " "
+		if l != r {
+			marker = "≠"
+		}
+		fmt.Fprintf(w, "%s %s\t%s\t%s\n", marker, label, l, r)
+	}
 
-	fmt.Fprintf(w, "Property\t%s\t%s\n", report1.Binary.Name, report2.Binary.Name)
-	fmt.Fprintf(w, "────────\t────────\t────────\n")
+	fmt.Fprintf(w, "  Property\t%s\t%s\n", left.Binary.Name, right.Binary.Name)
+	fmt.Fprintf(w, "  ────────\t────────\t────────\n")
 
-	// Basic info
-	fmt.Fprintf(w, "Size\t%d bytes\t%d bytes\n", report1.Binary.Size, report2.Binary.Size)
-	fmt.Fprintf(w, "Type\t%s\t%s\n", report1.Binary.FileType, report2.Binary.FileType)
-	fmt.Fprintf(w, "Arch\t%s\t%s\n", report1.Binary.Architecture, report2.Binary.Architecture)
+	row("Size", fmt.Sprintf("%d bytes", left.Binary.Size), fmt.Sprintf("%d bytes", right.Binary.Size))
+	row("Type", left.Binary.FileType, right.Binary.FileType)
+	row("Arch", left.Binary.Architecture, right.Binary.Architecture)
+	row("Risk score", fmt.Sprintf("%d/100", left.RiskScore), fmt.Sprintf("%d/100", right.RiskScore))
+	row("Risk level", left.RiskLevel, right.RiskLevel)
 
-	// Risk
-	fmt.Fprintf(w, "Risk Score\t%d/100\t%d/100\n", report1.RiskScore, report2.RiskScore)
-	fmt.Fprintf(w, "Risk Level\t%s\t%s\n", report1.RiskLevel, report2.RiskLevel)
+	row("Signed", signedLabel(left), signedLabel(right))
+	row("Signature valid", boolLabel(left.CodeSign != nil && left.CodeSign.IsValid), boolLabel(right.CodeSign != nil && right.CodeSign.IsValid))
+	row("Notarized", boolLabel(left.CodeSign != nil && left.CodeSign.IsNotarized), boolLabel(right.CodeSign != nil && right.CodeSign.IsNotarized))
+	row("Gatekeeper", boolLabel(left.CodeSign != nil && left.CodeSign.GatekeeperAccepted), boolLabel(right.CodeSign != nil && right.CodeSign.GatekeeperAccepted))
+	row("Hardened runtime", boolLabel(left.CodeSign != nil && left.CodeSign.HardenedRuntime), boolLabel(right.CodeSign != nil && right.CodeSign.HardenedRuntime))
+	row("Team", teamLabel(left), teamLabel(right))
 
-	// Code signing
-	fmt.Fprintf(w, "Signed\t%v\t%v\n", report1.CodeSign.IsSigned, report2.CodeSign.IsSigned)
-	fmt.Fprintf(w, "Valid\t%v\t%v\n", report1.CodeSign.IsValid, report2.CodeSign.IsValid)
-	fmt.Fprintf(w, "Notarized\t%v\t%v\n", report1.CodeSign.IsNotarized, report2.CodeSign.IsNotarized)
-	fmt.Fprintf(w, "Team\t%s\t%s\n", report1.CodeSign.TeamName, report2.CodeSign.TeamName)
-
-	// Entitlements
-	fmt.Fprintf(w, "Sandbox\t%v\t%v\n", report1.Entitlements.HasSandbox, report2.Entitlements.HasSandbox)
-	fmt.Fprintf(w, "Camera\t%v\t%v\n", report1.Entitlements.HasCamera, report2.Entitlements.HasCamera)
-	fmt.Fprintf(w, "Microphone\t%v\t%v\n", report1.Entitlements.HasMicrophone, report2.Entitlements.HasMicrophone)
-
-	// Warnings
-	fmt.Fprintf(w, "Warnings\t%d\t%d\n", len(report1.Warnings), len(report2.Warnings))
+	row("Sandbox", boolLabel(left.Entitlements != nil && left.Entitlements.HasSandbox), boolLabel(right.Entitlements != nil && right.Entitlements.HasSandbox))
+	row("Entitlements", countLabel(entCount(left)), countLabel(entCount(right)))
+	row("Risky entitlements", countLabel(dangerCount(left)), countLabel(dangerCount(right)))
+	row("Findings", countLabel(len(left.Warnings)), countLabel(len(right.Warnings)))
 
 	w.Flush()
 
-	// Hash comparison
 	fmt.Println()
-	if report1.Binary.SHA256 == report2.Binary.SHA256 {
-		fmt.Println("✓ Binaries are IDENTICAL (same SHA256 hash)")
-	} else {
-		fmt.Println("✗ Binaries are DIFFERENT")
+	switch {
+	case left.Binary.SHA256 == "" || right.Binary.SHA256 == "":
+		fmt.Println("? Could not hash both binaries; contents not compared")
+	case left.Binary.SHA256 == right.Binary.SHA256:
+		fmt.Println("✓ Binaries are IDENTICAL (same SHA256)")
+	default:
+		fmt.Println("✗ Binaries DIFFER")
+	}
+
+	// Naming what changed is the point of a comparison; a pair of counts is
+	// not actionable on its own.
+	if diff := signalDiff(left, right); diff != "" {
+		fmt.Println()
+		fmt.Println(diff)
 	}
 
 	return nil
+}
+
+func signalDiff(left, right *analyzer.AnalysisReport) string {
+	inLeft := signalSet(left)
+	inRight := signalSet(right)
+
+	var onlyLeft, onlyRight []string
+	for id, reason := range inLeft {
+		if _, ok := inRight[id]; !ok {
+			onlyLeft = append(onlyLeft, reason)
+		}
+	}
+	for id, reason := range inRight {
+		if _, ok := inLeft[id]; !ok {
+			onlyRight = append(onlyRight, reason)
+		}
+	}
+
+	var sb strings.Builder
+	if len(onlyLeft) > 0 {
+		fmt.Fprintf(&sb, "Only %s:\n", left.Binary.Name)
+		for _, r := range onlyLeft {
+			fmt.Fprintf(&sb, "  • %s\n", r)
+		}
+	}
+	if len(onlyRight) > 0 {
+		fmt.Fprintf(&sb, "Only %s:\n", right.Binary.Name)
+		for _, r := range onlyRight {
+			fmt.Fprintf(&sb, "  • %s\n", r)
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func signalSet(r *analyzer.AnalysisReport) map[string]string {
+	out := map[string]string{}
+	for _, s := range r.RiskSignals {
+		if s.Points > 0 {
+			out[s.ID] = s.Reason
+		}
+	}
+	return out
+}
+
+func signedLabel(r *analyzer.AnalysisReport) string {
+	if r.CodeSign == nil || !r.CodeSign.IsSigned {
+		return "no"
+	}
+	if r.CodeSign.IsAdHoc {
+		return "ad-hoc"
+	}
+	return "yes"
+}
+
+func teamLabel(r *analyzer.AnalysisReport) string {
+	if r.CodeSign == nil || r.CodeSign.TeamName == "" {
+		return "—"
+	}
+	return r.CodeSign.TeamName
+}
+
+func boolLabel(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func countLabel(n int) string {
+	return fmt.Sprintf("%d", n)
+}
+
+func entCount(r *analyzer.AnalysisReport) int {
+	if r.Entitlements == nil {
+		return 0
+	}
+	return len(r.Entitlements.All)
+}
+
+func dangerCount(r *analyzer.AnalysisReport) int {
+	if r.Entitlements == nil {
+		return 0
+	}
+	return len(r.Entitlements.Dangerous)
 }

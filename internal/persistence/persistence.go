@@ -2,248 +2,337 @@ package persistence
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/afterdarksys/osx-explain-a-bin/internal/plist"
+	"github.com/afterdarksys/osx-explain-a-bin/internal/strext"
 )
 
-// PersistenceInfo contains persistence-related findings
+// PersistenceInfo contains persistence-related findings.
 type PersistenceInfo struct {
-	HasLaunchAgent  bool               `json:"has_launch_agent"`
-	HasLaunchDaemon bool               `json:"has_launch_daemon"`
-	HasLoginItem    bool               `json:"has_login_item"`
-	HasCronJob      bool               `json:"has_cron_job"`
-	HasKernelExt    bool               `json:"has_kernel_ext"`
-	LaunchAgents    []LaunchItem       `json:"launch_agents,omitempty"`
-	LaunchDaemons   []LaunchItem       `json:"launch_daemons,omitempty"`
-	LoginItems      []string           `json:"login_items,omitempty"`
-	References      []PersistenceRef   `json:"references,omitempty"`
+	// Installed* report launchd jobs on this machine that actually invoke the
+	// binary under analysis.
+	InstalledAgents  []LaunchItem `json:"installed_launch_agents,omitempty"`
+	InstalledDaemons []LaunchItem `json:"installed_launch_daemons,omitempty"`
+
+	// Bundled* report launchd jobs shipped inside the application bundle,
+	// which it can install for itself.
+	BundledAgents  []LaunchItem `json:"bundled_launch_agents,omitempty"`
+	BundledDaemons []LaunchItem `json:"bundled_launch_daemons,omitempty"`
+
+	// References report persistence machinery named in the binary's strings.
+	// These are capabilities, not installations: a binary that mentions
+	// /Library/LaunchAgents may install one, or may only be reading them.
+	References []PersistenceRef `json:"references,omitempty"`
+
+	HasInstalledPersistence bool `json:"has_installed_persistence"`
+	HasBundledPersistence   bool `json:"has_bundled_persistence"`
+	HasLoginItem            bool `json:"has_login_item"`
+	HasCronJob              bool `json:"has_cron_job"`
+	HasKernelExt            bool `json:"has_kernel_ext"`
 }
 
-// LaunchItem represents a LaunchAgent or LaunchDaemon
+// LaunchItem represents a LaunchAgent or LaunchDaemon.
 type LaunchItem struct {
-	Path       string `json:"path"`
-	Label      string `json:"label"`
-	Program    string `json:"program"`
-	RunAtLoad  bool   `json:"run_at_load"`
-	KeepAlive  bool   `json:"keep_alive"`
+	Path      string   `json:"path"`
+	Label     string   `json:"label"`
+	Program   string   `json:"program"`
+	Arguments []string `json:"arguments,omitempty"`
+	RunAtLoad bool     `json:"run_at_load"`
+	KeepAlive bool     `json:"keep_alive"`
+
+	// ProgramFromArguments records that Program was taken from
+	// ProgramArguments[0] because the job declares no Program key. Most jobs
+	// are written that way, and the distinction keeps MatchedOn honest about
+	// which key the evidence actually came from.
+	ProgramFromArguments bool `json:"program_from_arguments,omitempty"`
+
+	// MatchedOn records which field tied this job to the binary, so a reader
+	// can check the tool's reasoning.
+	MatchedOn string `json:"matched_on,omitempty"`
 }
 
-// PersistenceRef represents a reference to a persistence mechanism in the binary
+// PersistenceRef represents a reference to a persistence mechanism found in
+// the binary's strings.
 type PersistenceRef struct {
 	Type        string `json:"type"`
-	Path        string `json:"path"`
+	Path        string `json:"path,omitempty"`
 	Description string `json:"description"`
 }
 
-// Analyze performs persistence analysis on a binary
-func Analyze(binaryPath, bundlePath string) *PersistenceInfo {
+// launchDirs are the standard launchd job directories, and whether jobs there
+// run as the user (agent) or as root (daemon).
+var launchDirs = []struct {
+	path    string
+	isAgent bool
+	inHome  bool
+}{
+	{"Library/LaunchAgents", true, true},
+	{"/Library/LaunchAgents", true, false},
+	{"/Library/LaunchDaemons", false, false},
+	{"/System/Library/LaunchAgents", true, false},
+	{"/System/Library/LaunchDaemons", false, false},
+}
+
+// Analyze performs persistence analysis on a binary.
+//
+// execPath is the actual executable; bundlePath is the enclosing .app, if any.
+// corpus is the binary's extracted strings, shared with the other analyzers.
+func Analyze(execPath, bundlePath string, corpus *strext.Corpus) *PersistenceInfo {
 	info := &PersistenceInfo{
-		LaunchAgents:  make([]LaunchItem, 0),
-		LaunchDaemons: make([]LaunchItem, 0),
-		LoginItems:    make([]string, 0),
-		References:    make([]PersistenceRef, 0),
+		References: make([]PersistenceRef, 0),
 	}
 
-	// Check for bundled LaunchAgents/Daemons
 	if bundlePath != "" {
-		checkBundlePersistence(info, bundlePath)
+		checkBundled(info, bundlePath)
 	}
+	checkReferences(info, corpus)
+	checkInstalled(info, execPath, bundlePath)
 
-	// Check for references in binary strings
-	checkBinaryReferences(info, binaryPath)
-
-	// Check if this binary is already installed as a launch item
-	checkInstalledPersistence(info, binaryPath)
+	info.HasBundledPersistence = len(info.BundledAgents) > 0 || len(info.BundledDaemons) > 0
+	info.HasInstalledPersistence = len(info.InstalledAgents) > 0 || len(info.InstalledDaemons) > 0
 
 	return info
 }
 
-// checkBundlePersistence checks for persistence items in an app bundle
-func checkBundlePersistence(info *PersistenceInfo, bundlePath string) {
-	// Check for LaunchAgents in bundle
-	launchAgentDir := filepath.Join(bundlePath, "Contents", "Library", "LaunchAgents")
-	if entries, err := os.ReadDir(launchAgentDir); err == nil {
-		for _, entry := range entries {
-			if strings.HasSuffix(entry.Name(), ".plist") {
-				info.HasLaunchAgent = true
-				plistPath := filepath.Join(launchAgentDir, entry.Name())
-				item := parseLaunchPlist(plistPath)
-				info.LaunchAgents = append(info.LaunchAgents, item)
-			}
-		}
-	}
-
-	// Check for LaunchDaemons in bundle
-	launchDaemonDir := filepath.Join(bundlePath, "Contents", "Library", "LaunchDaemons")
-	if entries, err := os.ReadDir(launchDaemonDir); err == nil {
-		for _, entry := range entries {
-			if strings.HasSuffix(entry.Name(), ".plist") {
-				info.HasLaunchDaemon = true
-				plistPath := filepath.Join(launchDaemonDir, entry.Name())
-				item := parseLaunchPlist(plistPath)
-				info.LaunchDaemons = append(info.LaunchDaemons, item)
+// checkBundled looks for launchd jobs shipped inside an app bundle.
+func checkBundled(info *PersistenceInfo, bundlePath string) {
+	for _, sub := range []struct {
+		dir     string
+		isAgent bool
+	}{
+		{filepath.Join(bundlePath, "Contents", "Library", "LaunchAgents"), true},
+		{filepath.Join(bundlePath, "Contents", "Library", "LaunchDaemons"), false},
+	} {
+		for _, item := range readLaunchDir(sub.dir) {
+			if sub.isAgent {
+				info.BundledAgents = append(info.BundledAgents, item)
+			} else {
+				info.BundledDaemons = append(info.BundledDaemons, item)
 			}
 		}
 	}
 }
 
-// checkBinaryReferences looks for persistence-related strings in the binary
-func checkBinaryReferences(info *PersistenceInfo, binaryPath string) {
-	content, err := os.ReadFile(binaryPath)
-	if err != nil {
+// checkInstalled finds launchd jobs on this machine that invoke this binary.
+//
+// Matching is on the resolved program path, not the file's name. Matching on
+// the name meant that analyzing /bin/ls reported every launchd job whose plist
+// contained the letters "ls" -- which is most of them -- as that binary's own
+// persistence, and charged it 35 risk points for the privilege.
+func checkInstalled(info *PersistenceInfo, execPath, bundlePath string) {
+	targets := targetPaths(execPath, bundlePath)
+	if len(targets) == 0 {
 		return
 	}
 
-	contentStr := string(content)
+	home, _ := os.UserHomeDir()
 
-	// LaunchAgent paths
-	launchAgentPaths := []string{
-		"/Library/LaunchAgents",
-		"~/Library/LaunchAgents",
-		"$HOME/Library/LaunchAgents",
-	}
-	for _, path := range launchAgentPaths {
-		if strings.Contains(contentStr, path) {
-			info.HasLaunchAgent = true
-			info.References = append(info.References, PersistenceRef{
-				Type:        "launch_agent",
-				Path:        path,
-				Description: "References LaunchAgents directory",
-			})
+	for _, d := range launchDirs {
+		dir := d.path
+		if d.inHome {
+			if home == "" {
+				continue
+			}
+			dir = filepath.Join(home, d.path)
 		}
-	}
 
-	// LaunchDaemon paths
-	launchDaemonPaths := []string{
-		"/Library/LaunchDaemons",
-		"/System/Library/LaunchDaemons",
-	}
-	for _, path := range launchDaemonPaths {
-		if strings.Contains(contentStr, path) {
-			info.HasLaunchDaemon = true
-			info.References = append(info.References, PersistenceRef{
-				Type:        "launch_daemon",
-				Path:        path,
-				Description: "References LaunchDaemons directory",
-			})
+		for _, item := range readLaunchDir(dir) {
+			matched := matchTarget(item, targets)
+			if matched == "" {
+				continue
+			}
+			item.MatchedOn = matched
+			if d.isAgent {
+				info.InstalledAgents = append(info.InstalledAgents, item)
+			} else {
+				info.InstalledDaemons = append(info.InstalledDaemons, item)
+			}
 		}
-	}
-
-	// Login Items
-	if strings.Contains(contentStr, "LSSharedFileList") ||
-		strings.Contains(contentStr, "loginwindow") ||
-		strings.Contains(contentStr, "LoginItems") {
-		info.HasLoginItem = true
-		info.References = append(info.References, PersistenceRef{
-			Type:        "login_item",
-			Path:        "",
-			Description: "References Login Items API",
-		})
-	}
-
-	// Cron
-	if strings.Contains(contentStr, "/var/at/tabs") ||
-		strings.Contains(contentStr, "crontab") {
-		info.HasCronJob = true
-		info.References = append(info.References, PersistenceRef{
-			Type:        "cron",
-			Path:        "/var/at/tabs",
-			Description: "References cron",
-		})
-	}
-
-	// Kernel extensions
-	if strings.Contains(contentStr, ".kext") ||
-		strings.Contains(contentStr, "kextload") ||
-		strings.Contains(contentStr, "KextManager") {
-		info.HasKernelExt = true
-		info.References = append(info.References, PersistenceRef{
-			Type:        "kernel_ext",
-			Path:        "",
-			Description: "References kernel extensions",
-		})
 	}
 }
 
-// checkInstalledPersistence checks if the binary is already installed as a launch item
-func checkInstalledPersistence(info *PersistenceInfo, binaryPath string) {
-	// Get absolute path
-	absPath, _ := filepath.Abs(binaryPath)
-	binaryName := filepath.Base(absPath)
+// targetPaths returns the paths that would identify this binary in a launchd
+// job: the executable itself, its symlink-resolved form, and the bundle.
+func targetPaths(execPath, bundlePath string) []string {
+	seen := map[string]bool{}
+	var out []string
 
-	// Check user LaunchAgents
-	homeDir, _ := os.UserHomeDir()
-	userLaunchAgents := filepath.Join(homeDir, "Library", "LaunchAgents")
-	checkLaunchDir(info, userLaunchAgents, absPath, binaryName, true)
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
 
-	// Check system LaunchAgents
-	checkLaunchDir(info, "/Library/LaunchAgents", absPath, binaryName, true)
+	add(execPath)
+	if resolved, err := filepath.EvalSymlinks(execPath); err == nil {
+		add(resolved)
+	}
+	add(bundlePath)
 
-	// Check LaunchDaemons
-	checkLaunchDir(info, "/Library/LaunchDaemons", absPath, binaryName, false)
+	return out
 }
 
-// checkLaunchDir checks a launch directory for items referencing the binary
-func checkLaunchDir(info *PersistenceInfo, dir, binaryPath, binaryName string, isAgent bool) {
+// matchTarget reports which field of a launchd job refers to one of the target
+// paths, or "" if none does.
+func matchTarget(item LaunchItem, targets []string) string {
+	candidates := append([]string{item.Program}, item.Arguments...)
+
+	for _, target := range targets {
+		for i, c := range candidates {
+			if c == "" {
+				continue
+			}
+			cleaned := filepath.Clean(c)
+			if cleaned == target {
+				if i == 0 && !item.ProgramFromArguments {
+					return "Program"
+				}
+				return "ProgramArguments"
+			}
+			// A job that launches something inside the bundle -- a helper in
+			// Contents/MacOS, say -- is still this application persisting.
+			if strings.HasPrefix(cleaned, target+string(filepath.Separator)) {
+				return "path within bundle"
+			}
+		}
+	}
+	return ""
+}
+
+// readLaunchDir parses every plist in a launchd job directory.
+func readLaunchDir(dir string) []LaunchItem {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		return nil
+	}
+
+	items := make([]LaunchItem, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".plist") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if item, ok := parseLaunchPlist(path); ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+// parseLaunchPlist decodes a launchd job description.
+//
+// This used to spawn `defaults read` four times per plist -- four processes
+// for every job in every launchd directory -- and read only Program, which
+// most jobs do not set; they use ProgramArguments instead, which is why the
+// old output showed launch items with empty Program fields.
+func parseLaunchPlist(path string) (LaunchItem, bool) {
+	dict, err := plist.ParseFile(path)
+	if err != nil {
+		return LaunchItem{}, false
+	}
+
+	item := LaunchItem{
+		Path:      path,
+		Label:     dict.String("Label"),
+		Program:   dict.String("Program"),
+		Arguments: dict.StringSlice("ProgramArguments"),
+		RunAtLoad: dict.Bool("RunAtLoad"),
+	}
+
+	// KeepAlive is either a boolean or a dictionary of conditions; both mean
+	// launchd will restart the job.
+	switch v := dict["KeepAlive"].(type) {
+	case bool:
+		item.KeepAlive = v
+	case plist.Dict:
+		item.KeepAlive = len(v) > 0
+	}
+
+	// With no Program key, launchd runs ProgramArguments[0].
+	if item.Program == "" && len(item.Arguments) > 0 {
+		item.Program = item.Arguments[0]
+		item.ProgramFromArguments = true
+	}
+	if item.Label == "" {
+		item.Label = strings.TrimSuffix(filepath.Base(path), ".plist")
+	}
+
+	return item, true
+}
+
+// checkReferences records persistence machinery named in the binary's strings.
+func checkReferences(info *PersistenceInfo, corpus *strext.Corpus) {
+	if corpus == nil {
 		return
 	}
 
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".plist") {
+	for _, ref := range []struct {
+		needles []string
+		typ     string
+		path    string
+		desc    string
+	}{
+		{
+			[]string{"/Library/LaunchAgents", "Library/LaunchAgents"},
+			"launch_agent", "/Library/LaunchAgents",
+			"References the LaunchAgents directory",
+		},
+		{
+			[]string{"/Library/LaunchDaemons"},
+			"launch_daemon", "/Library/LaunchDaemons",
+			"References the LaunchDaemons directory",
+		},
+		{
+			[]string{"SMJobBless", "SMAppService", "launchctl"},
+			"launchd_api", "",
+			"Uses the launchd job-installation API",
+		},
+		{
+			[]string{"LSSharedFileList", "SMLoginItemSetEnabled", "LoginItems"},
+			"login_item", "",
+			"Uses the Login Items API",
+		},
+		{
+			[]string{"/var/at/tabs", "crontab"},
+			"cron", "/var/at/tabs",
+			"References cron",
+		},
+		{
+			[]string{"kextload", "KextManager", "OSKext"},
+			"kernel_ext", "",
+			"References kernel extension loading",
+		},
+		{
+			[]string{"NSXPCConnection", "xpc_connection_create"},
+			"xpc", "",
+			"Uses XPC services",
+		},
+	} {
+		if !corpus.ContainsAny(ref.needles...) {
 			continue
 		}
-
-		plistPath := filepath.Join(dir, entry.Name())
-		content, err := os.ReadFile(plistPath)
-		if err != nil {
-			continue
-		}
-
-		// Check if plist references our binary
-		if strings.Contains(string(content), binaryPath) ||
-			strings.Contains(string(content), binaryName) {
-			item := parseLaunchPlist(plistPath)
-
-			if isAgent {
-				info.HasLaunchAgent = true
-				info.LaunchAgents = append(info.LaunchAgents, item)
-			} else {
-				info.HasLaunchDaemon = true
-				info.LaunchDaemons = append(info.LaunchDaemons, item)
-			}
+		info.References = append(info.References, PersistenceRef{
+			Type:        ref.typ,
+			Path:        ref.path,
+			Description: ref.desc,
+		})
+		switch ref.typ {
+		case "login_item":
+			info.HasLoginItem = true
+		case "cron":
+			info.HasCronJob = true
+		case "kernel_ext":
+			info.HasKernelExt = true
 		}
 	}
-}
-
-// parseLaunchPlist parses a launchd plist file
-func parseLaunchPlist(path string) LaunchItem {
-	item := LaunchItem{
-		Path: path,
-	}
-
-	// Use defaults command to read plist
-	cmd := exec.Command("defaults", "read", path, "Label")
-	if output, err := cmd.Output(); err == nil {
-		item.Label = strings.TrimSpace(string(output))
-	}
-
-	cmd = exec.Command("defaults", "read", path, "Program")
-	if output, err := cmd.Output(); err == nil {
-		item.Program = strings.TrimSpace(string(output))
-	}
-
-	cmd = exec.Command("defaults", "read", path, "RunAtLoad")
-	if output, err := cmd.Output(); err == nil {
-		item.RunAtLoad = strings.TrimSpace(string(output)) == "1"
-	}
-
-	cmd = exec.Command("defaults", "read", path, "KeepAlive")
-	if output, err := cmd.Output(); err == nil {
-		item.KeepAlive = strings.TrimSpace(string(output)) == "1"
-	}
-
-	return item
 }
