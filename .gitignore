@@ -1,0 +1,4 @@
+# Local agent/session state and generated artifacts
+.omc/
+build/
+explain-bin
